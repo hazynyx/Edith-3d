@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EDITH</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', Courier, monospace; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        /* JARVIS UI Style */
+        #ui-layer { 
+            position: absolute; top: 20px; left: 20px; color: #00f3ff; 
+            z-index: 3; pointer-events: none; text-shadow: 0 0 5px #00f3ff;
+            background: linear-gradient(90deg, rgba(0,20,40,0.9) 0%, rgba(0,0,0,0) 100%);
+            padding: 20px; border-left: 3px solid #00f3ff;
+            width: 300px;
+        }
+        h1 { font-weight: 700; margin: 0; letter-spacing: 2px; font-size: 1.4rem; text-transform: uppercase; }
+        .sub-text { font-size: 0.7rem; opacity: 0.8; margin-bottom: 15px; color: #aaddff; }
+        .hud-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 0.85rem; border-bottom: 1px solid rgba(0, 243, 255, 0.2); padding-bottom: 4px; }
+        .hud-label { opacity: 0.7; }
+        .hud-value { font-weight: bold; color: white; }
+        .active-gesture { color: #0f0; text-shadow: 0 0 8px #0f0; }
+        #video-feed { 
+            position: absolute; bottom: 20px; right: 20px; width: 200px; height: 150px; 
+            transform: scaleX(-1); border: 1px solid #00f3ff; 
+            opacity: 0.2; z-index: 2; mix-blend-mode: screen; border-radius: 4px;
+        }
+        #hand-canvas {
+            position: absolute; bottom: 20px; right: 20px; width: 200px; height: 150px; 
+            transform: scaleX(-1); z-index: 3; pointer-events: none; border-radius: 4px;
+        }
+        #loading { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            color: #00f3ff; z-index: 10; font-size: 1.2rem; letter-spacing: 2px;
+            animation: pulse 1s infinite alternate;
+        }
+        #camera-error {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            color: #ff0000; z-index: 11; font-size: 1.1rem; text-shadow: 0 0 5px #ff0000;
+            display: none; 
+            padding: 20px;
+            background: rgba(40, 0, 0, 0.8);
+            border: 2px solid #ff0000;
+        }
+        @keyframes pulse { from { opacity: 0.5; } to { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div id="ui-layer">
+        <h1>EDITH</h1>
+        <div class="sub-text">GESTURE INTERFACE: ACTIVE</div>
+        <div class="hud-row"><span class="hud-label">MODE</span> <span id="mode-display" class="hud-value">IDLE</span></div>
+        <div class="hud-row"><span class="hud-label">ZOOM</span> <span id="zoom-display" class="hud-value">1.0x</span></div>
+        <div class="hud-row"><span class="hud-label">SHAPE</span> <span id="shape-display" class="hud-value">ATOM</span></div>
+        <div style="margin-top: 15px; font-size: 0.7rem; color: #ffeb3b; line-height: 1.4; border-top: 1px solid rgba(255,235,59,0.5); padding-top: 10px;">
+            <b style="color:#fff;">[SPACEBAR]</b>: Switch Shape (Manual)<br>
+            ► <b>PALM MOVE</b>: Rotate View (Smooth, Natural)<br>
+            ► <b>PINCH (HOLD)</b>: Zoom In<br>
+            ► <b>DOUBLE PINCH</b>: Zoom Out<br>
+            ► <b>FIST</b>: System Collapse
+        </div>
+    </div>
+    <div id="loading">CALIBRATING SENSORS...</div>
+    <div id="camera-error">
+        <p>🔴 **ERROR: CAMERA ACCESS DENIED** 🔴</p>
+        <p>Please check your browser's security settings and grant webcam permission. Then refresh.</p>
+    </div>
+    <video id="video-feed" playsinline></video>
+    <canvas id="hand-canvas"></canvas>
+    <div id="canvas-container"></div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { FilesetResolver, HandLandmarker, FaceLandmarker } from 'https://cdn.skypack.dev/@mediapipe/tasks-vision@0.10.0';
+        // --- CONFIG & STATE ---
+        const CONFIG = {
+            particleCount: 100000,
+            doublePinchTiming: 300,
+            rotationMultiplier: 1.5, 
+            rotationSmoothness: 0.1,
+            dnaRungsPerTurn: 20, // Particles per 360 degrees to define rungs
+            heartScale: 18 // Scale factor for the heart shape
+        };
+        const STATE = {
+            currentScale: 1.0,
+            targetScale: 1.0,
+            rotation: { x: 0, y: 0 },
+            isPinching: false,
+            pinchStartTime: 0,
+            lastPinchReleaseTime: 0,
+            isDoublePinchActive: false,
+            isFist: false,
+            shapeIndex: 0
+        };
+        const shapes = ['ATOM', 'DNA', 'SPHERE', 'GALAXY', 'CUBE', 'HEART', 'SATURN', 'FACE'];
+        let scene, camera, renderer, composer, particles, material;
+        let handLandmarker, faceLandmarker, video, handCanvas, handCtx;
+        let targetPositions; 
+        let uiElements = {};
+        let bloomPassInstance; 
+        // --- INIT & SETUP ---
+        async function init() {
+            uiElements = {
+                mode: document.getElementById('mode-display'),
+                zoom: document.getElementById('zoom-display'),
+                shape: document.getElementById('shape-display'),
+                loading: document.getElementById('loading'),
+                cameraError: document.getElementById('camera-error')
+            };
+            setup3D();
+            await setupVision();
+            setupKeyboardControls(); 
+            uiElements.loading.style.display = 'none';
+            animate();
+        }
+        // --- 3D & SHADER FUNCTIONS (Unchanged) ---
+        function setup3D() { 
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000510, 0.02);
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 50;
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+            const renderScene = new RenderPass(scene, camera);
+            bloomPassInstance = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPassInstance.threshold = 0;
+            bloomPassInstance.strength = 1.2; 
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPassInstance);
+            createParticles();
+        }
+        function createParticles() { 
+            const geometry = new THREE.BufferGeometry();
+            targetPositions = new Float32Array(CONFIG.particleCount * 3);
+            const positions = new Float32Array(CONFIG.particleCount * 3);
+            const randoms = new Float32Array(CONFIG.particleCount);
+            for(let i=0; i<CONFIG.particleCount; i++) {
+                positions[i*3] = (Math.random()-0.5)*100; positions[i*3+1] = (Math.random()-0.5)*100; positions[i*3+2] = (Math.random()-0.5)*100;
+                randoms[i] = Math.random();
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('aRandom', new THREE.BufferAttribute(randoms, 1));
+            material = new THREE.ShaderMaterial({
+                uniforms: { uTime: { value: 0 }, uScale: { value: 1 }, uColor: { value: new THREE.Color(0x00aaff) }, uImplode: { value: 0 } },
+                vertexShader: ` uniform float uTime; uniform float uScale; uniform float uImplode; attribute float aRandom; varying float vAlpha; void main() { vec3 pos = position; pos *= (1.0 + sin(uTime + pos.y * 0.1) * 0.02); pos = mix(pos, pos * 0.01, uImplode); pos *= uScale; vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0); gl_Position = projectionMatrix * mvPosition; float size = (80.0 * aRandom + 10.0); gl_PointSize = size / -mvPosition.z; vAlpha = (1.0 - uImplode) * 0.8 + 0.2; } `,
+                fragmentShader: ` uniform vec3 uColor; varying float vAlpha; void main() { vec2 xy = gl_PointCoord.xy - vec2(0.5); float r = length(xy); if (r > 0.5) discard; float glow = 1.0 - (r * 2.0); glow = pow(glow, 1.5); gl_FragColor = vec4(uColor, vAlpha * glow); } `,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+            });
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+            calculateShape('ATOM');
+        }
+        function setupKeyboardControls() { 
+            window.addEventListener('keydown', (event) => {
+                if (event.code === 'Space') {
+                    event.preventDefault();
+                    nextShape();
+                }
+            });
+        }
+        function nextShape() { 
+             STATE.shapeIndex = (STATE.shapeIndex + 1) % shapes.length;
+             const shapeName = shapes[STATE.shapeIndex];
+             uiElements.shape.innerText = shapeName;
+             calculateShape(shapeName);
+             bloomPassInstance.strength = 5.0;
+             setTimeout(() => bloomPassInstance.strength = 1.2, 200);
+        }
+        // --- MATH SHAPES (Fix and New Shapes Applied Here) ---
+        function calculateShape(type) {
+            const pos = targetPositions;
+            for(let i=0; i<CONFIG.particleCount; i++) {
+                const i3 = i*3;
+                let x=0, y=0, z=0;
+                const random = Math.random();
+                if(type === 'ATOM') {
+                    if(random < 0.15) {
+                         const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+                         const r = 4 * Math.cbrt(Math.random());
+                         x=r*Math.sin(phi)*Math.cos(theta); y=r*Math.sin(phi)*Math.sin(theta); z=r*Math.cos(phi);
+                    } else {
+                        const r = 15 + Math.random()*2;
+                        const angle = Math.random()*Math.PI*2;
+                        const band = Math.floor(Math.random()*3);
+                        const tilt = [0, Math.PI/3, -Math.PI/3][band];
+                        const tx = r*Math.cos(angle), ty = r*Math.sin(angle);
+                        x = tx; y = ty * Math.cos(tilt); z = ty * Math.sin(tilt);
+                    }
+                } else if (type === 'SPHERE') {
+                    const r = 20;
+                    const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+                    x=r*Math.sin(phi)*Math.cos(theta); y=r*Math.sin(phi)*Math.sin(theta); z=r*Math.cos(phi);
+                } else if (type === 'CUBE') {
+                     const s = 25;
+                     x=(Math.random()-0.5)*s; y=(Math.random()-0.5)*s; z=(Math.random()-0.5)*s;
+                } else if (type === 'DNA') {
+                    // Improved DNA: 3.5 turns over height 100 makes an open, realistic double helix structure
+                    const helixRadius = 8;
+                    const helixHeight = 100;
+                    const turns = 3.5;
+                    const v = (i / CONFIG.particleCount);
+                    const t = v * turns * Math.PI * 2;
+                    y = v * helixHeight - (helixHeight / 2);
+
+                    if (random < 0.4) {
+                        // BACKBONE
+                        const phase = (i % 2 === 0) ? 0 : Math.PI;
+                        const rNoise = (Math.random() - 0.5) * 0.8;
+                        x = (helixRadius + rNoise) * Math.cos(t + phase);
+                        z = (helixRadius + rNoise) * Math.sin(t + phase);
+                        y += (Math.random() - 0.5) * 0.8;
+                    } else {
+                        // RUNGS
+                        const rungsPerTurn = 10;
+                        const rungCount = Math.floor(turns * rungsPerTurn);
+                        const rungIndex = Math.floor(v * rungCount);
+                        const tRung = (rungIndex / rungCount) * turns * Math.PI * 2;
+
+                        const x1 = helixRadius * Math.cos(tRung);
+                        const z1 = helixRadius * Math.sin(tRung);
+                        const x2 = helixRadius * Math.cos(tRung + Math.PI);
+                        const z2 = helixRadius * Math.sin(tRung + Math.PI);
+
+                        const p = Math.random();
+                        x = x1 + (x2 - x1) * p + (Math.random() - 0.5) * 0.8;
+                        z = z1 + (z2 - z1) * p + (Math.random() - 0.5) * 0.8;
+                        y = (rungIndex / rungCount) * helixHeight - (helixHeight / 2) + (Math.random() - 0.5) * 0.8;
+                    }
+                } else if (type === 'HEART') {
+                        let x2d, y2d;
+                        let attempts = 0;
+                        while (true) {
+                            x2d = (Math.random() * 2 - 1) * 1.2;
+                            y2d = (Math.random() * 2 - 1) * 1.2;
+                            const a = x2d * x2d + y2d * y2d - 1;
+                            if (a * a * a - x2d * x2d * y2d * y2d * y2d <= 0) break;
+                            attempts++;
+                            if (attempts > 30) {
+                                x2d = (Math.random() * 2 - 1);
+                                y2d = (Math.random() * 2 - 1);
+                                break;
+                            }
+                        }
+                        const zDepth = (Math.random() * 2 - 1) * 0.6;
+                        const HS = CONFIG.heartScale * 0.8;
+                        x = x2d * HS;
+                        y = y2d * HS;
+                        z = zDepth * HS * 0.4;
+                } else if (type === 'SATURN') {
+                    const saturnRadius = 15;
+                    const ringInner = 20;
+                    const ringOuter = 30;
+                    const ringThickness = 0.5;
+                    if (random < 0.3) {
+                        const r = saturnRadius * Math.cbrt(Math.random());
+                        const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+                        x=r*Math.sin(phi)*Math.cos(theta); y=r*Math.sin(phi)*Math.sin(theta); z=r*Math.cos(phi);
+                    } else {
+                        const r = ringInner + (ringOuter - ringInner) * Math.random();
+                        const angle = Math.random() * Math.PI * 2;
+                        x = r * Math.cos(angle);
+                        z = r * Math.sin(angle);
+                        y = (Math.random() - 0.5) * ringThickness;
+                        const tiltAngle = Math.PI / 9;
+                        const newY = y * Math.cos(tiltAngle) - z * Math.sin(tiltAngle);
+                        const newZ = y * Math.sin(tiltAngle) + z * Math.cos(tiltAngle);
+                        y = newY;
+                        z = newZ;
+                    }
+                } else if (type === 'FACE') {
+                    const s = 10;
+                    x = (Math.random() - 0.5) * s;
+                    y = (Math.random() - 0.5) * s;
+                    z = (Math.random() - 0.5) * s;
+                } else { // GALAXY 
+                    const arms = 3;
+                    const arm = Math.floor(Math.random() * arms);
+                    const core = Math.random();
+                    const r = core > 0.8 ? Math.random() * 40 : Math.pow(Math.random(), 2) * 40;
+                    const spiralAngle = r * 0.18;
+                    const armOffset = (arm / arms) * Math.PI * 2;
+                    const spread = (Math.random() - 0.5) * Math.PI * (1.2 / (r * 0.1 + 1));
+                    const angle = armOffset + spiralAngle + spread;
+                    x = r * Math.cos(angle);
+                    z = r * Math.sin(angle);
+                    const bulge = Math.exp(-r * 0.2) * 15;
+                    const discThickness = 2;
+                    y = (Math.random() - 0.5) * (bulge + discThickness);
+                }
+                pos[i3] = x; pos[i3+1] = y; pos[i3+2] = z;
+            }
+        }
+        function processGestures(results) {
+            if (handCtx) handCtx.clearRect(0, 0, handCanvas.width, handCanvas.height);
+            if (!results.landmarks || results.landmarks.length === 0) {
+                uiElements.mode.innerText = "NO HAND";
+                uiElements.mode.className = "hud-value";
+                return;
+            }
+            const lm = results.landmarks[0];
+            
+            // Draw EDITH HUD style skeleton
+            if (handCtx) {
+                handCtx.lineWidth = 1.5;
+                handCtx.strokeStyle = "rgba(0, 243, 255, 0.8)";
+                handCtx.fillStyle = "rgba(0, 243, 255, 0.4)";
+                
+                const connections = [
+                    [0,1], [1,2], [2,3], [3,4],
+                    [0,5], [5,6], [6,7], [7,8],
+                    [5,9], [9,10], [10,11], [11,12],
+                    [9,13], [13,14], [14,15], [15,16],
+                    [13,17], [17,18], [18,19], [19,20],
+                    [0,17]
+                ];
+                connections.forEach(([p1, p2]) => {
+                    handCtx.beginPath();
+                    handCtx.moveTo(lm[p1].x * handCanvas.width, lm[p1].y * handCanvas.height);
+                    handCtx.lineTo(lm[p2].x * handCanvas.width, lm[p2].y * handCanvas.height);
+                    handCtx.stroke();
+                });
+                
+                lm.forEach((point, index) => {
+                    handCtx.beginPath();
+                    handCtx.arc(point.x * handCanvas.width, point.y * handCanvas.height, [4,8,12,16,20].includes(index) ? 4 : 2, 0, 2 * Math.PI);
+                    handCtx.fill();
+                    if ([4,8,12,16,20].includes(index)) handCtx.stroke();
+                });
+            }
+            const now = Date.now();
+            const cx = (lm[0].x + lm[9].x) / 2;
+            const cy = (lm[0].y + lm[9].y) / 2;
+            const nx = (cx - 0.5) * -CONFIG.rotationMultiplier; 
+            const ny = (cy - 0.5) * CONFIG.rotationMultiplier;  
+            STATE.rotation.x = ny; 
+            STATE.rotation.y = nx; 
+            const wrist = lm[0];
+            const tips = [8, 12, 16, 20];
+            let foldedFingers = 0;
+            tips.forEach(t => {
+                const d = Math.hypot(lm[t].x - wrist.x, lm[t].y - wrist.y);
+                if (d < 0.15) foldedFingers++;
+            });
+            if (foldedFingers >= 3) {
+                STATE.isFist = true;
+                uiElements.mode.innerText = "COLLAPSE";
+                uiElements.mode.className = "hud-value active-gesture";
+                return;
+            } else {
+                STATE.isFist = false;
+            }
+            const thumb = lm[4];
+            const index = lm[8];
+            const pinchDist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+            const isPinchingNow = pinchDist < 0.05;
+            if (isPinchingNow) {
+                if (!STATE.isPinching) {
+                    STATE.isPinching = true;
+                    STATE.pinchStartTime = now;
+                    if (now - STATE.lastPinchReleaseTime < CONFIG.doublePinchTiming) {
+                        STATE.isDoublePinchActive = true;
+                    } else {
+                        STATE.isDoublePinchActive = false;
+                    }
+                }
+                const duration = now - STATE.pinchStartTime;
+                const zoomSpeed = 0.01 + (duration / 50000);
+                if (STATE.isDoublePinchActive) {
+                    uiElements.mode.innerText = "ZOOM OUT";
+                    uiElements.mode.className = "hud-value active-gesture";
+                    STATE.targetScale = Math.max(0.2, STATE.targetScale - zoomSpeed * 1.5);
+                } else {
+                    uiElements.mode.innerText = "ZOOM IN";
+                    uiElements.mode.className = "hud-value active-gesture";
+                    STATE.targetScale = Math.min(5.0, STATE.targetScale + zoomSpeed);
+                }
+            } else {
+                if (STATE.isPinching) {
+                    STATE.lastPinchReleaseTime = now;
+                }
+                STATE.isPinching = false;
+                uiElements.mode.innerText = "ROTATING";
+                uiElements.mode.className = "hud-value";
+            }
+            uiElements.zoom.innerText = STATE.targetScale.toFixed(1) + "x";
+        }
+        // --- VISION SETUP (Error Handling Included) ---
+        async function setupVision() {
+            try {
+                const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+                    runningMode: "VIDEO",
+                    numHands: 1
+                });
+                faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                    baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`, delegate: "GPU" },
+                    runningMode: "VIDEO",
+                    outputFaceBlendshapes: false,
+                    numFaces: 1
+                });
+                video = document.getElementById("video-feed");
+                handCanvas = document.getElementById("hand-canvas");
+                handCtx = handCanvas.getContext("2d");
+                handCanvas.width = 200;
+                handCanvas.height = 150;
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+                return new Promise(r => { 
+                    video.onloadedmetadata = () => { video.play(); r(); }
+                });
+            } catch (error) {
+                console.error("Camera access failed:", error);
+                uiElements.loading.style.display = 'none';
+                uiElements.cameraError.style.display = 'block';
+                throw new Error("Camera initialization failed.");
+            }
+        }
+        function animate() { /* Unchanged */
+            requestAnimationFrame(animate);
+            const time = performance.now() * 0.001;
+            if (video && video.currentTime > 0) {
+                const results = handLandmarker.detectForVideo(video, performance.now());
+                processGestures(results);
+
+                const faceResults = faceLandmarker.detectForVideo(video, performance.now());
+                if (faceResults.faceLandmarks && faceResults.faceLandmarks.length > 0) {
+                    const faceLm = faceResults.faceLandmarks[0];
+                    
+                    if (handCtx) {
+                        handCtx.fillStyle = "rgba(0, 243, 255, 0.4)";
+                        faceLm.forEach((point) => {
+                            handCtx.beginPath();
+                            handCtx.arc(point.x * handCanvas.width, point.y * handCanvas.height, 0.8, 0, 2 * Math.PI);
+                            handCtx.fill();
+                        });
+                    }
+
+                    if (shapes[STATE.shapeIndex] === 'FACE') {
+                        const pos = targetPositions;
+                        
+                        // Center the face mesh so it rotates as a 3D object in the scene
+                        let cx = 0, cy = 0, cz = 0;
+                        for (let p of faceLm) { cx += p.x; cy += p.y; cz += p.z; }
+                        cx /= faceLm.length; cy /= faceLm.length; cz /= faceLm.length;
+                        
+                        const edges = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
+                        const hasEdges = edges && edges.length > 0;
+                        
+                        for(let i=0; i<CONFIG.particleCount; i++) {
+                            const i3 = i*3;
+                            let pt = {x: 0, y: 0, z: 0};
+                            
+                            // Create a detailed surface by distributing particles along the mesh
+                            if (hasEdges) {
+                                const edge = edges[i % edges.length];
+                                const p1 = faceLm[edge.start];
+                                const p2 = faceLm[edge.end];
+                                const t = Math.random();
+                                pt.x = p1.x + (p2.x - p1.x) * t;
+                                pt.y = p1.y + (p2.y - p1.y) * t;
+                                pt.z = p1.z + (p2.z - p1.z) * t;
+                            } else {
+                                // Fallback: find a nearby point to interpolate a surface
+                                const p1 = faceLm[i % faceLm.length];
+                                let p2 = p1;
+                                for (let j=0; j<8; j++) {
+                                    const cand = faceLm[Math.floor(Math.random() * faceLm.length)];
+                                    const dx = cand.x - p1.x, dy = cand.y - p1.y;
+                                    if (dx*dx + dy*dy < 0.002) { p2 = cand; break; }
+                                }
+                                const t = Math.random();
+                                pt.x = p1.x + (p2.x - p1.x) * t;
+                                pt.y = p1.y + (p2.y - p1.y) * t;
+                                pt.z = p1.z + (p2.z - p1.z) * t;
+                            }
+                            
+                            // Scale uniformly to preserve real 3D proportions
+                            const SCALE = 120; 
+                            const tx = (pt.x - cx) * -SCALE; // Mirror X
+                            const ty = -(pt.y - cy) * SCALE;
+                            const tz = -(pt.z - cz) * SCALE;
+                            
+                            // Decreased distance spread by 70% for sharper detail
+                            const noise = 0.045; 
+                            pos[i3]   = tx + (Math.random() - 0.5) * noise;
+                            pos[i3+1] = ty + (Math.random() - 0.5) * noise;
+                            pos[i3+2] = tz + (Math.random() - 0.5) * noise;
+                        }
+                    }
+                }
+            }
+            STATE.currentScale += (STATE.targetScale - STATE.currentScale) * 0.1;
+            material.uniforms.uScale.value = STATE.currentScale;
+            const rotationLerp = CONFIG.rotationSmoothness;
+            particles.rotation.x += (STATE.rotation.x - particles.rotation.x) * rotationLerp;
+            particles.rotation.y += (STATE.rotation.y - particles.rotation.y) * rotationLerp;
+            const targetImplode = STATE.isFist ? 1.0 : 0.0;
+            material.uniforms.uImplode.value += (targetImplode - material.uniforms.uImplode.value) * 0.1;
+            const positions = particles.geometry.attributes.position.array;
+            const lerp = 0.06;
+            for(let i=0; i<CONFIG.particleCount; i++) {
+                const i3 = i*3;
+                positions[i3]   += (targetPositions[i3] - positions[i3]) * lerp;
+                positions[i3+1] += (targetPositions[i3+1] - positions[i3+1]) * lerp;
+                positions[i3+2] += (targetPositions[i3+2] - positions[i3+2]) * lerp;
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+            material.uniforms.uTime.value = time;
+            composer.render();
+        }
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+        init();
+    </script>
+</body>
+</html>
+
