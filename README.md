@@ -2,7 +2,7 @@
 
 > **Even Dead I'm The Hero** — A next-generation, high-performance gesture-controlled interactive 3D particle system inspired by Tony Stark's EDITH system.
 
-![EDITH Particle Interface](image.png)
+![EDITH Particle Interface](preview.png)
 
 EDITH is an immersive, web-based 3D particle simulation that leverages **Three.js** for rendering and **Google MediaPipe Tasks Vision** for real-time hand and face tracking. Interact with 100,000 glowing particles dynamically floating in space using natural hand movements, gestures, and facial structures detected via your webcam.
 
@@ -71,4 +71,4 @@ To run EDITH locally:
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-Developed with ❤️ by [Ayush Gupta](https://github.com/hazynyx).
+Developed with ❤️ by [Hazynyx](https://github.com/hazynyx).
